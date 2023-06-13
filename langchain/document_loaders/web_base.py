@@ -1,7 +1,8 @@
 """Web base loader class."""
 import asyncio
 import logging
-from typing import Any, List, Optional, Union
+import warnings
+from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 import requests
@@ -9,7 +10,7 @@ import requests
 from langchain.docstore.document import Document
 from langchain.document_loaders.base import BaseLoader
 
-logger = logging.getLogger(__file__)
+logger = logging.getLogger(__name__)
 
 default_header_template = {
     "User-Agent": "",
@@ -46,6 +47,9 @@ class WebBaseLoader(BaseLoader):
     default_parser: str = "html.parser"
     """Default parser to use for BeautifulSoup."""
 
+    requests_kwargs: Dict[str, Any] = {}
+    """kwargs for requests"""
+
     def __init__(
         self, web_path: Union[str, List[str]], header_template: Optional[dict] = None
     ):
@@ -67,17 +71,19 @@ class WebBaseLoader(BaseLoader):
                 "bs4 package not found, please install it with " "`pip install bs4`"
             )
 
-        try:
-            from fake_useragent import UserAgent
+        headers = header_template or default_header_template
+        if not headers.get("User-Agent"):
+            try:
+                from fake_useragent import UserAgent
 
-            headers = header_template or default_header_template
-            headers["User-Agent"] = UserAgent().random
-            self.session.headers = dict(headers)
-        except ImportError:
-            logger.info(
-                "fake_useragent not found, using default user agent."
-                "To get a realistic header for requests, `pip install fake_useragent`."
-            )
+                headers["User-Agent"] = UserAgent().random
+            except ImportError:
+                logger.info(
+                    "fake_useragent not found, using default user agent."
+                    "To get a realistic header for requests, "
+                    "`pip install fake_useragent`."
+                )
+        self.session.headers = dict(headers)
 
     @property
     def web_path(self) -> str:
@@ -85,10 +91,26 @@ class WebBaseLoader(BaseLoader):
             raise ValueError("Multiple webpaths found.")
         return self.web_paths[0]
 
-    async def _fetch(self, url: str) -> str:
+    async def _fetch(
+        self, url: str, retries: int = 3, cooldown: int = 2, backoff: float = 1.5
+    ) -> str:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=self.session.headers) as response:
-                return await response.text()
+            for i in range(retries):
+                try:
+                    async with session.get(
+                        url, headers=self.session.headers
+                    ) as response:
+                        return await response.text()
+                except aiohttp.ClientConnectionError as e:
+                    if i == retries - 1:
+                        raise
+                    else:
+                        logger.warning(
+                            f"Error fetching {url} with attempt "
+                            f"{i + 1}/{retries}: {e}. Retrying..."
+                        )
+                        await asyncio.sleep(cooldown * backoff**i)
+        raise ValueError("retry count exceeded")
 
     async def _fetch_with_rate_limit(
         self, url: str, semaphore: asyncio.Semaphore
@@ -103,7 +125,15 @@ class WebBaseLoader(BaseLoader):
         for url in urls:
             task = asyncio.ensure_future(self._fetch_with_rate_limit(url, semaphore))
             tasks.append(task)
-        return await asyncio.gather(*tasks)
+        try:
+            from tqdm.asyncio import tqdm_asyncio
+
+            return await tqdm_asyncio.gather(
+                *tasks, desc="Fetching pages", ascii=True, mininterval=1
+            )
+        except ImportError:
+            warnings.warn("For better logging of progress, `pip install tqdm`")
+            return await asyncio.gather(*tasks)
 
     @staticmethod
     def _check_parser(parser: str) -> None:
@@ -143,7 +173,8 @@ class WebBaseLoader(BaseLoader):
 
         self._check_parser(parser)
 
-        html_doc = self.session.get(url)
+        html_doc = self.session.get(url, **self.requests_kwargs)
+        html_doc.encoding = html_doc.apparent_encoding
         return BeautifulSoup(html_doc.text, parser)
 
     def scrape(self, parser: Union[str, None] = None) -> Any:
